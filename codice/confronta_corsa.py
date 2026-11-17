@@ -1,8 +1,8 @@
-"""Confronta una corsa live con Riferimento.csv su una finestra mobile.
+"""Confronta le medie di una corsa live e di Riferimento.csv su una finestra mobile.
 
 Legge: il JSON del simulatore e dati/corse/Riferimento.csv.
-Produce: le differenze per variabile a ogni metro percorso. Il valore singolo
-che riassume le differenze è lasciato da definire in combina_differenze().
+Produce: media live, media di riferimento e differenza per ogni variabile,
+ricalcolate ogni PASSO_GRIGLIA_METRI metri.
 Avvio: python codice/confronta_corsa.py
 """
 
@@ -12,7 +12,6 @@ import math
 import time
 import urllib.error
 import urllib.request
-from bisect import bisect_left
 from pathlib import Path
 
 
@@ -24,6 +23,7 @@ FILE_RIFERIMENTO = (
 LUNGHEZZA_FINESTRA_METRI = 1000
 PASSO_GRIGLIA_METRI = 1
 INTERVALLO_LETTURA_SECONDI = 0.1
+CAMPO_DISTANZA = "distanza_m"
 
 
 def carica_riferimento(percorso):
@@ -48,9 +48,6 @@ def carica_riferimento(percorso):
     return riferimento
 
 
-CAMPO_DISTANZA = "distanza_m"
-
-
 def leggi_campione():
     """Richiede al simulatore un campione JSON aggiornato."""
     richiesta = urllib.request.Request(
@@ -63,59 +60,51 @@ def leggi_campione():
     return campione
 
 
-def combina_differenze(differenze):
-    """Punto da completare quando sarà definita la formula del valore singolo.
-
-    Riceve un dizionario: nome variabile -> lista di coppie
-    (distanza in metri, valore live meno valore di riferimento).
-    """
-    return None
-
-
 def confronta_finestra(riferimento, campioni_live, metro_finale, variabili):
-    """Confronta i campioni nelle ultime 1000 posizioni della griglia."""
+    """Confronta le medie delle misure nella finestra spaziale corrente."""
     metro_iniziale = metro_finale - LUNGHEZZA_FINESTRA_METRI
-    differenze = {nome: [] for nome in variabili}
-    metri_disponibili = sorted(
-        metro
-        for metro in campioni_live
+    righe_riferimento = [
+        riga
+        for metro, riga in riferimento.items()
         if metro_iniziale <= metro <= metro_finale
-    )
-    if not metri_disponibili:
-        return differenze
-
-    for metro in range(metro_iniziale, metro_finale + 1, PASSO_GRIGLIA_METRI):
-        riga_riferimento = riferimento.get(metro)
-        if riga_riferimento is None:
-            continue
-
-        # Cerca il campione live più vicino al metro richiesto, usando soltanto
-        # misure già acquisite nella finestra. La ricerca binaria evita di
-        # scandire tutti i campioni a ogni metro.
-        posizione = bisect_left(metri_disponibili, metro)
-        indici = [
-            indice
-            for indice in (posizione - 1, posizione)
-            if 0 <= indice < len(metri_disponibili)
-        ]
-        metro_live = min(
-            (metri_disponibili[indice] for indice in indici),
-            key=lambda valore: abs(valore - metro),
-        )
-        riga_live = campioni_live[metro_live]
-
-        for nome in variabili:
+    ]
+    righe_live = [
+        riga
+        for riga in campioni_live
+        if metro_iniziale <= riga[CAMPO_DISTANZA] <= metro_finale
+    ]
+    risultati = {}
+    for nome in variabili:
+        valori_riferimento = []
+        for riga in righe_riferimento:
             try:
-                valore_live = float(riga_live[nome])
-                valore_riferimento = float(riga_riferimento[nome])
+                valori_riferimento.append(float(riga[nome]))
             except (KeyError, TypeError, ValueError):
                 continue
-            differenze[nome].append((metro, valore_live - valore_riferimento))
-
-    return differenze
+        valori_live = []
+        for riga in righe_live:
+            try:
+                valori_live.append(float(riga[nome]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not valori_riferimento or not valori_live:
+            continue
+        media_riferimento = sum(valori_riferimento) / len(valori_riferimento)
+        media_live = sum(valori_live) / len(valori_live)
+        risultati[nome] = {
+            "media_riferimento": media_riferimento,
+            "media_live": media_live,
+            "differenza": media_live - media_riferimento,
+        }
+    return risultati
 
 
 def main():
+    if LUNGHEZZA_FINESTRA_METRI <= 0:
+        raise ValueError("LUNGHEZZA_FINESTRA_METRI deve essere maggiore di zero.")
+    if PASSO_GRIGLIA_METRI <= 0:
+        raise ValueError("PASSO_GRIGLIA_METRI deve essere maggiore di zero.")
+
     riferimento = carica_riferimento(FILE_RIFERIMENTO)
     variabili = sorted(
         nome
@@ -131,8 +120,8 @@ def main():
     distanza_corrente = 0.0
     tempo_precedente = None
     velocita_precedente = None
-    ultimo_metro_confrontato = LUNGHEZZA_FINESTRA_METRI - 1
-    campioni_live = {}
+    prossimo_metro_confronto = LUNGHEZZA_FINESTRA_METRI
+    campioni_live = []
     simulatore_attivo = False
 
     try:
@@ -147,7 +136,7 @@ def main():
                 # nuova corsa: si azzerano distanza e campioni precedenti.
                 if tempo_precedente is not None and tempo < tempo_precedente:
                     distanza_corrente = 0.0
-                    ultimo_metro_confrontato = LUNGHEZZA_FINESTRA_METRI - 1
+                    prossimo_metro_confronto = LUNGHEZZA_FINESTRA_METRI
                     campioni_live.clear()
                     velocita_precedente = None
 
@@ -158,51 +147,38 @@ def main():
                             (velocita_precedente + velocita) * intervallo / 2
                         )
 
-                # Conserva i campioni live sulla griglia di distanza al metro.
-                metro_campione = round(distanza_corrente)
+                # Conserva ogni misura con la sua distanza effettiva.
                 campione_con_distanza = dict(campione)
                 campione_con_distanza[CAMPO_DISTANZA] = distanza_corrente
-                campioni_live[metro_campione] = campione_con_distanza
+                campioni_live.append(campione_con_distanza)
 
-                # Appena viene raggiunto un nuovo metro, aggiorna il confronto.
+                # Ricalcola le medie a ogni intervallo configurato in metri.
                 metro_attuale = math.floor(distanza_corrente)
-                while ultimo_metro_confrontato < metro_attuale:
-                    ultimo_metro_confrontato += PASSO_GRIGLIA_METRI
-                    if ultimo_metro_confrontato < LUNGHEZZA_FINESTRA_METRI:
-                        continue
-
-                    differenze = confronta_finestra(
-                        riferimento,
-                        campioni_live,
-                        ultimo_metro_confrontato,
-                        variabili,
+                while prossimo_metro_confronto <= metro_attuale:
+                    risultati = confronta_finestra(
+                        riferimento, campioni_live, prossimo_metro_confronto, variabili
                     )
-                    valore_singolo = combina_differenze(differenze)
-                    quantita = sum(len(valori) for valori in differenze.values())
-                    metro_iniziale = (
-                        ultimo_metro_confrontato - LUNGHEZZA_FINESTRA_METRI
-                    )
-                    risultato = (
-                        "da definire"
-                        if valore_singolo is None
-                        else str(valore_singolo)
-                    )
+                    metro_iniziale = prossimo_metro_confronto - LUNGHEZZA_FINESTRA_METRI
+                    riepilogo = "; ".join(
+                        f"{nome}: media live={v['media_live']:.3f}, "
+                        f"media riferimento={v['media_riferimento']:.3f}, "
+                        f"differenza={v['differenza']:.3f}"
+                        for nome, v in risultati.items()
+                    ) or "nessuna misura confrontabile"
                     print(
-                        f"Finestra {metro_iniziale}-{ultimo_metro_confrontato} m: "
-                        f"{quantita} differenze disponibili; valore combinato: {risultato}"
+                        f"Finestra {metro_iniziale}-{prossimo_metro_confronto} m: "
+                        f"{riepilogo}"
                     )
+                    prossimo_metro_confronto += PASSO_GRIGLIA_METRI
 
-                # Elimina i campioni più vecchi di quelli necessari alla
-                # finestra corrente, mantenendo un margine di un metro.
+                # Mantiene i campioni utili alla prossima finestra mobile.
                 limite_inferiore = max(
-                    0,
-                    ultimo_metro_confrontato - LUNGHEZZA_FINESTRA_METRI - 1,
+                    0, prossimo_metro_confronto - LUNGHEZZA_FINESTRA_METRI
                 )
-                campioni_live = {
-                    metro: riga
-                    for metro, riga in campioni_live.items()
-                    if metro >= limite_inferiore
-                }
+                campioni_live = [
+                    riga for riga in campioni_live
+                    if riga[CAMPO_DISTANZA] >= limite_inferiore
+                ]
 
                 tempo_precedente = tempo
                 velocita_precedente = velocita
